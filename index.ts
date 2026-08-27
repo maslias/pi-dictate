@@ -1,10 +1,10 @@
 /**
  * dictate — minimal voice dictation for pi.
  *
- * Press alt+m to start, press it again to stop.
- * Press alt+n to cancel and discard the in-flight transcript.
+ * Press ctrl+shift+m to start, press it again to stop.
+ * Press escape to cancel and discard the in-flight transcript.
  *
- * Focus-aware: alt+m/alt+n are intercepted at the TUI input layer (before any
+ * Focus-aware: ctrl+shift+m/escape are intercepted at the TUI input layer (before any
  * focused component), so dictation works inside ANY dialog — quiz popups,
  * ask_user_question, ctx.ui.editor()/input() — not just the main chat editor.
  *
@@ -56,16 +56,26 @@ const dbg = (msg: string) => {
 //   smart_format=true   — formats numbers, dates, currencies nicely
 //   punctuate=true      — adds commas/periods/question marks
 //   endpointing=300     — 300ms of silence ends an utterance (faster finals)
-const DG_URL =
-  "wss://api.deepgram.com/v1/listen" +
-  "?model=nova-3" +
-  "&encoding=linear16" +
-  "&sample_rate=16000" +
-  "&channels=1" +
-  "&interim_results=false" +
-  "&smart_format=true" +
-  "&punctuate=true" +
-  "&endpointing=300";
+//   language=<code>     — selected by /dictate-language or /dictate-language-switch; default cycle is de/en-US
+const LANGUAGE_PRESETS = [
+  { code: "de", label: "German" },
+  { code: "en-US", label: "English" },
+];
+
+function buildDeepgramUrl(languageCode: string): string {
+  const params = new URLSearchParams({
+    model: "nova-3",
+    encoding: "linear16",
+    sample_rate: "16000",
+    channels: "1",
+    interim_results: "false",
+    smart_format: "true",
+    punctuate: "true",
+    endpointing: "300",
+    language: languageCode,
+  });
+  return `wss://api.deepgram.com/v1/listen?${params.toString()}`;
+}
 
 type State = "idle" | "recording" | "stopping";
 
@@ -73,7 +83,7 @@ type State = "idle" | "recording" | "stopping";
 // The TUI handle is captured once via a zero-height widget factory (the only
 // extension-API surface that exposes it). With it we can:
 //   1. Listen to ALL terminal input via tui.addInputListener — listeners run
-//      before the focused component, so alt+m works even while a custom
+//      before the focused component, so ctrl+shift+m works even while a custom
 //      dialog has stolen focus from the main editor (extension shortcuts are
 //      otherwise only matched by the main editor component).
 //   2. Inspect tui.focusedComponent to decide where the transcript goes.
@@ -153,6 +163,31 @@ export default function (pi: ExtensionAPI) {
   let meterTimer: NodeJS.Timeout | null = null;
   let meter: number[] = new Array(METER_CELLS).fill(0);
   let currentLevel = 0;
+  let languageIndex = 0;
+
+  const currentLanguage = () => LANGUAGE_PRESETS[languageIndex] ?? LANGUAGE_PRESETS[0]!;
+
+  const announceLanguage = (ctx: ExtensionContext) => {
+    const lang = currentLanguage();
+    const suffix = state === "idle" ? "" : " (applies to next dictation)";
+    ctx.ui.notify(`Dictation language: ${lang.label}${suffix}`);
+  };
+
+  const cycleLanguage = (ctx: ExtensionContext) => {
+    languageIndex = (languageIndex + 1) % LANGUAGE_PRESETS.length;
+    announceLanguage(ctx);
+  };
+
+  const setLanguage = (codeOrLabel: string, ctx: ExtensionContext): boolean => {
+    const wanted = codeOrLabel.trim().toLowerCase();
+    const idx = LANGUAGE_PRESETS.findIndex(
+      (lang) => lang.code.toLowerCase() === wanted || lang.label.toLowerCase() === wanted,
+    );
+    if (idx < 0) return false;
+    languageIndex = idx;
+    announceLanguage(ctx);
+    return true;
+  };
 
   const setStatus = (msg: string | undefined) => {
     if (!activeCtx) return;
@@ -185,7 +220,7 @@ export default function (pi: ExtensionAPI) {
     // ASCII, swap the glyph for "O".)
     const render = () => {
       const dot = activeCtx?.ui.theme.fg("error", "●") ?? "●";
-      setStatus(`${dot} ${meter.map(rmsToBlock).join("")} listening…`);
+      setStatus(`${dot} ${meter.map(rmsToBlock).join("")} listening… ${currentLanguage().label}`);
     };
     render();
     meterTimer = setInterval(() => {
@@ -364,7 +399,7 @@ export default function (pi: ExtensionAPI) {
     // Open Deepgram WebSocket. Auth via subprotocol (portable across Node native
     // WebSocket and browsers): `new WebSocket(url, ["token", API_KEY])`.
     try {
-      ws = new WebSocket(DG_URL, ["token", apiKey]);
+      ws = new WebSocket(buildDeepgramUrl(currentLanguage().code), ["token", apiKey]);
     } catch (e: any) {
       ctx.ui.notify(`Deepgram WS failed: ${e.message}`, "error");
       cleanup();
@@ -481,26 +516,26 @@ export default function (pi: ExtensionAPI) {
     // Ignore presses during the "stopping" state — Deepgram is finalizing.
   };
 
-  // Global input listener: catches alt+m/alt+n before ANY focused component,
+  // Global input listener: catches ctrl+shift+m/escape before ANY focused component,
   // which is what makes dictation work inside dialogs. Registered once the
   // TUI handle is captured (see session_start below).
   const onGlobalInput = (data: string) => {
     // Kitty flag-2 terminals send press + REPEAT + RELEASE events, and input
     // listeners run BEFORE the TUI's release filter (that filter only guards
     // dispatch to the focused component). matchesKey also ignores the Kitty
-    // event type. Without this guard a single physical alt+m press toggles
+    // event type. Without this guard a single physical ctrl+shift+m press toggles
     // TWICE: press starts dictation, release instantly stops it and closes
     // the WebSocket mid-handshake — which then surfaces as
     // "Deepgram WebSocket error" (and its stale error event can kill the NEXT
     // session). Filter to press events only.
     if (isKeyRelease(data) || isKeyRepeat(data)) return undefined;
-    if (matchesKey(data, Key.alt("m"))) {
-      dbg(`alt+m (data=${JSON.stringify(data)}) state=${state}`);
+    if (matchesKey(data, Key.ctrlShift("m"))) {
+      dbg(`ctrl+shift+m (data=${JSON.stringify(data)}) state=${state}`);
       if (lastCtx) toggleDictation(lastCtx);
       return { consume: true };
     }
-    if (matchesKey(data, Key.alt("n"))) {
-      dbg(`alt+n (data=${JSON.stringify(data)}) state=${state}`);
+    if ((state === "recording" || state === "stopping") && matchesKey(data, Key.escape)) {
+      dbg(`escape cancel (data=${JSON.stringify(data)}) state=${state}`);
       cancelDictation();
       return { consume: true };
     }
@@ -524,19 +559,39 @@ export default function (pi: ExtensionAPI) {
   // handle was never captured (non-TUI modes, older pi): they only fire when
   // the main editor is focused, but that's precisely the legacy path. When
   // the listener IS installed it consumes the key first, so no double-fire.
-  pi.registerShortcut(Key.alt("m"), {
+  pi.registerShortcut(Key.ctrlShift("m"), {
     description: "Toggle voice dictation (Deepgram)",
     handler: async (ctx) => {
       toggleDictation(ctx);
     },
   });
 
-  // Dedicated cancel binding. Dictation-only — a no-op when no dictation is
-  // in flight, so it's safe to hammer without affecting anything else.
-  pi.registerShortcut(Key.alt("n"), {
-    description: "Cancel voice dictation (discard transcript)",
-    handler: async () => {
-      cancelDictation();
+  pi.registerCommand("dictate-language-switch", {
+    description: "Cycle voice dictation language (German ↔ English)",
+    handler: async (_args, ctx) => {
+      cycleLanguage(ctx);
+    },
+  });
+
+  pi.registerCommand("dictate-language", {
+    description: "Set voice dictation language: /dictate-language de|en-US|german|english",
+    getArgumentCompletions: (prefix: string) => {
+      const items = LANGUAGE_PRESETS.flatMap((lang) => [
+        { value: lang.code, label: lang.label },
+        { value: lang.label.toLowerCase(), label: lang.label },
+      ]);
+      const p = prefix.toLowerCase();
+      return items.filter((item) => item.value.toLowerCase().startsWith(p));
+    },
+    handler: async (args, ctx) => {
+      const value = (args ?? "").trim();
+      if (!value) {
+        announceLanguage(ctx);
+        return;
+      }
+      if (!setLanguage(value, ctx)) {
+        ctx.ui.notify("Usage: /dictate-language de|en-US|german|english", "warning");
+      }
     },
   });
 
